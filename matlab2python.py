@@ -255,7 +255,7 @@ savemat('data.mat', {'x_center': x_center, 'y_center': y_center, 'z_surface': z_
 # ax.set_xlabel('X (mm)')
 # ax.set_ylabel('Y (mm)')
 # ax.set_zlabel('Height (mm)')
-# plt.show()
+
 
 plt.figure()
 plt.imshow(z_surface, cmap='viridis')
