@@ -58,6 +58,13 @@ _ring_min_dist   = max(3, 8 // DOWNSCALE)
 # Lower = more sensitive (more rings), but also more noise.  Increase if
 # spurious rings appear in flat/noisy regions.
 _ring_prominence = 0.1
+# Minimum fraction of a circle's arc that must lie inside the image for
+# that radius to be included in the radial profile.  Allows detection of
+# rings whose centre is near or outside the ROI edge.
+_min_arc_frac    = 0.20   # 20 % — rejects tiny slivers with unreliable mean
+# Pixels within this many pixels of the image boundary are excluded from
+# the radial profile to avoid CLAHE / DoG normalisation edge artefacts.
+_profile_margin  = 5
 
 
 def _lap(label, t_prev):
@@ -147,18 +154,45 @@ def process_image(img_name, img_file):
     # ── 5. Radial profile → ring radii ───────────────────────────────────────
     # Compute the mean normalised value on concentric circles at each radius.
     # Dark fringes (destructive interference) appear as local minima.
+    #
+    # When the ring centre is near the image edge (as happens when the
+    # interference pattern shifts during a sequence), many rings extend
+    # partially outside the ROI.  We allow radii up to the furthest corner and
+    # sample only the in-bounds arc fraction, discarding radii where fewer than
+    # _min_arc_frac of the circle is inside the image.
     from scipy.signal import find_peaks
 
-    max_r = min(cy, H - cy, cx, W - cx) - 2
-    r_vals = np.arange(1, max_r)
-    profile = np.zeros(len(r_vals), dtype=np.float32)
+    # Maximum radius: furthest corner from centre (full arc or partial arc)
+    max_r = int(np.ceil(max(
+        np.hypot(cx,     cy),
+        np.hypot(W - cx, cy),
+        np.hypot(cx,     H - cy),
+        np.hypot(W - cx, H - cy),
+    )))
 
+    r_vals  = np.arange(1, max_r + 1)
+    profile = np.full(len(r_vals), np.nan, dtype=np.float64)
+
+    pm = _profile_margin
     for i, r in enumerate(r_vals):
-        n_ang = max(16, int(2 * np.pi * r))
-        ang = np.linspace(0, 2 * np.pi, n_ang, endpoint=False)
-        xs = np.clip(np.round(cx + r * np.cos(ang)).astype(int), 0, W - 1)
-        ys = np.clip(np.round(cy + r * np.sin(ang)).astype(int), 0, H - 1)
-        profile[i] = img_norm[ys, xs].mean()
+        n_ang = max(32, int(2 * np.pi * r))
+        ang   = np.linspace(0, 2 * np.pi, n_ang, endpoint=False)
+        xs    = np.round(cx + r * np.cos(ang)).astype(int)
+        ys    = np.round(cy + r * np.sin(ang)).astype(int)
+        # Exclude pixels within _profile_margin of the image boundary to
+        # avoid CLAHE / DoG normalisation edge artefacts.
+        valid = (xs >= pm) & (xs < W - pm) & (ys >= pm) & (ys < H - pm)
+        # Require at least _min_arc_frac of the circle to be inside the image
+        if valid.sum() >= _min_arc_frac * n_ang:
+            profile[i] = img_norm[ys[valid], xs[valid]].mean()
+
+    # Interpolate NaN gaps (arcs mostly outside the image) so find_peaks
+    # doesn't stumble on discontinuities
+    nan_mask = np.isnan(profile)
+    if nan_mask.any() and (~nan_mask).sum() >= 2:
+        profile[nan_mask] = np.interp(
+            r_vals[nan_mask], r_vals[~nan_mask], profile[~nan_mask]
+        )
 
     # Find minima of profile (dark fringes).  Tune prominence/distance if
     # too many or too few rings are detected.
@@ -189,6 +223,14 @@ def process_image(img_name, img_file):
     yy, xx = np.mgrid[0:H, 0:W]
     dist_map = np.hypot(xx - cx, yy - cy).astype(np.float32)
 
+    # Fringe validity mask: only extract contours where there is actual
+    # illumination.  Pixels where the smoothed original image is darker than
+    # 20 % of the ROI's max brightness carry no useful fringe information —
+    # they are outside the beam footprint.  This suppresses spurious contours
+    # in dark / unilluminated corners.
+    illum = cv2.GaussianBlur(img_f, (0, 0), float(_dog_sigma2))
+    valid_illum = (illum > 0.20 * illum.max()).astype(np.uint8)
+
     skel_all  = np.zeros((H, W), dtype=bool)
     order_map = np.zeros((H, W), dtype=int)   # fringe order at each pixel
 
@@ -198,8 +240,8 @@ def process_image(img_name, img_file):
 
         band = (dist_map >= r_lo) & (dist_map <= r_hi)
 
-        # Dark fringe pixels within this band
-        fringe_bw = ((img_norm < 0) & band).astype(np.uint8)
+        # Dark fringe pixels within this band, restricted to illuminated area
+        fringe_bw = ((img_norm < 0) & band & valid_illum.astype(bool)).astype(np.uint8)
 
         # Remove tiny noise blobs
         n_cc, cc_map, stats, _ = cv2.connectedComponentsWithStats(fringe_bw, 8)
@@ -275,7 +317,7 @@ def process_image(img_name, img_file):
 def main():
 
     import os
-    image_folder = './20260330_215004'
+    image_folder =  './20260330_215004' #'./20260330_215619' # 
     image_files = sorted([f for f in os.listdir(image_folder) if f.lower().endswith('.png')])
 
     if image_files:
