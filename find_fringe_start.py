@@ -25,12 +25,16 @@ DARK_DIR   = os.path.join(_SCIMAGE, 'Dark')
 FIELD_DIR  = os.path.join(_SCIMAGE, 'Field')
 OUT_DIR    = os.path.join(_SCIMAGE, 'Output')
 
-ROI_SLICE  = np.s_[1200:2100, 2000:3100]   # (900 × 1100) region of interest
+ROI_SLICE  = np.s_[300:3000, 1800:4080]    # (2700 × 2280) region of interest
 
-# Fringe spatial-frequency band (in cycles per ROI height H)
-# Fringe periods: 30–300 px in the full-res ROI → freq = H / period
-FRINGE_PERIOD_MIN_PX = 30    # highest spatial frequency (finest fringes)
-FRINGE_PERIOD_MAX_PX = 300   # lowest spatial frequency  (coarsest fringes)
+# Fringe spatial-frequency band — periods in full-resolution ROI pixels
+FRINGE_PERIOD_MIN_PX = 30    # finest fringe period (px, full-res)
+FRINGE_PERIOD_MAX_PX = 300   # coarsest fringe period (px, full-res)
+
+# Downscale factor applied to the ROI before FFT (speeds up ~downscale^2×).
+# Fringe period bounds are divided by this factor so the detected frequency
+# band stays correct in the smaller image.
+FFT_DOWNSCALE = 4
 
 # Onset detection: first frame whose energy exceeds baseline + K * baseline_std
 BASELINE_N_FRAMES = 5        # number of leading quiet frames used for baseline
@@ -56,32 +60,26 @@ def flat_field_correct(raw_f32, mean_dark, divisor):
     return np.clip(corr, 0, None)
 
 
-def fringe_band_energy(roi_f32):
+def fringe_band_energy(roi_f32, downscale=1):
     """
     Compute total PSD power in the fringe spatial-frequency band.
 
-    Steps:
-      1. Apply 2-D Hann window to suppress spectral leakage at ROI edges.
-      2. 2-D FFT → shift DC to centre → |FFT|^2.
-      3. Radially average the PSD (concentric-ring fringes have isotropic
-         frequency content, so the radial average is the natural summary).
-      4. Sum the radial bins whose period falls in [FRINGE_PERIOD_MIN_PX,
-         FRINGE_PERIOD_MAX_PX].
+    roi_f32   : float32 ROI (already resized if downscale > 1)
+    downscale : factor by which the ROI was resized — used to scale the
+                period bounds so they stay correct in the smaller image.
 
     Returns
-      energy   : float  – total fringe-band power
-      psd_2d   : 2-D array  – |FFT|^2 (shifted), for visualisation
-      radial   : 1-D array  – radially averaged PSD
-      r_vals   : 1-D array  – corresponding radius / freq index
+      energy   : float        – total fringe-band power
+      psd_2d   : 2-D array    – |FFT|^2 (shifted), for visualisation
+      radial   : 1-D array    – radially averaged PSD
+      r_vals   : 1-D array    – corresponding radius / freq index
+      f_lo, f_hi : int        – fringe band limits in frequency index
     """
     H, W = roi_f32.shape
 
-    # 2-D Hann window
     win  = np.outer(np.hanning(H), np.hanning(W)).astype(np.float32)
-    spec = np.fft.fft2(roi_f32 * win)
-    psd  = np.abs(np.fft.fftshift(spec)) ** 2
+    psd  = np.abs(np.fft.fftshift(np.fft.fft2(roi_f32 * win))) ** 2
 
-    # Radial average
     cy, cx = H // 2, W // 2
     yy, xx = np.mgrid[0:H, 0:W]
     rr     = np.round(np.hypot(xx - cx, yy - cy)).astype(np.int32)
@@ -90,13 +88,14 @@ def fringe_band_energy(roi_f32):
     rr_clip = np.clip(rr.ravel(), 0, max_r)
     psd_sum = np.bincount(rr_clip, weights=psd.ravel(), minlength=max_r + 1)
     psd_cnt = np.bincount(rr_clip, minlength=max_r + 1).astype(np.float64)
-    psd_cnt = np.where(psd_cnt == 0, 1, psd_cnt)
-    radial  = psd_sum[:max_r] / psd_cnt[:max_r]
+    radial  = psd_sum[:max_r] / np.where(psd_cnt[:max_r] == 0, 1, psd_cnt[:max_r])
     r_vals  = np.arange(len(radial))
 
-    # Frequency band: radius = H / period_px
-    f_lo = max(1, int(H / FRINGE_PERIOD_MAX_PX))
-    f_hi = min(len(radial) - 1, int(H / FRINGE_PERIOD_MIN_PX) + 1)
+    # Scale period bounds to match the downscaled image
+    period_min = max(1, FRINGE_PERIOD_MIN_PX // downscale)
+    period_max = max(2, FRINGE_PERIOD_MAX_PX // downscale)
+    f_lo = max(1, int(H / period_max))
+    f_hi = min(len(radial) - 1, int(H / period_min) + 1)
 
     energy = float(radial[f_lo:f_hi].sum())
     return energy, psd, radial, r_vals, f_lo, f_hi
@@ -171,7 +170,14 @@ def main():
         corr = flat_field_correct(raw, mean_dark, divisor)
         roi  = corr[ROI_SLICE]
 
-        energy, psd_2d, radial, r_vals, f_lo, f_hi = fringe_band_energy(roi)
+        if FFT_DOWNSCALE > 1:
+            roi = cv2.resize(roi,
+                             (roi.shape[1] // FFT_DOWNSCALE,
+                              roi.shape[0] // FFT_DOWNSCALE),
+                             interpolation=cv2.INTER_AREA)
+
+        energy, psd_2d, radial, r_vals, f_lo, f_hi = fringe_band_energy(
+            roi, downscale=FFT_DOWNSCALE)
         energies.append(energy)
 
         if r_vals_ref is None:
