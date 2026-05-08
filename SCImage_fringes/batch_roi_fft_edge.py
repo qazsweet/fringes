@@ -54,6 +54,15 @@ MASK_X0, MASK_X1 = 1275, 1475
 
 COLOR_EDGE = (0, 255, 0)  # BGR 绿色
 
+# Pre-contact detection uses central-disk standard deviation on the
+# preprocessed (CLAHE) quarter-resolution image.  In pre-contact frames the
+# image centre contains visible Newton's ring texture (std ≈ 20–55); once
+# contact forms, the centre is a flat dark zone with no fringe pattern
+# (std ≤ 11 even for the very first contact frame).
+# Threshold sits in the gap: pre-contact min ≈ 20, contact max ≈ 11.
+CENTRAL_DISK_R    = 50    # radius of the test disk (quarter-res pixels)
+CENTRAL_STD_THRESH = 15   # std > this → ring texture present → pre-contact
+
 
 def iter_images(folder: Path) -> list[Path]:
     out: list[Path] = []
@@ -286,10 +295,42 @@ def _fit_circle_kasa(pts: np.ndarray):
     return (float(cx), float(cy), float(np.sqrt(r2))) if r2 > 0 else None
 
 
-def draw_edges_bgr(small_gray: np.ndarray, contours: list) -> np.ndarray:
+def draw_edges_bgr(
+    small_gray: np.ndarray, contours: list, img_name: str = ""
+) -> tuple[np.ndarray, float, str]:
+    """
+    Detect fringe ring and return (vis_bgr, radius_px, flag).
+
+    flag values
+    -----------
+    ""            – valid detection; radius_px is the innermost contact ring radius
+    "pre_contact" – Newton's rings from a pre-contact (no large contact zone) phase;
+                    ring texture is visible around the image centre (centre disk std >
+                    CENTRAL_STD_THRESH), meaning complete concentric rings are still
+                    present.  radius_px is returned as 0.0.
+    "no_detection"– no reliable fringe ring found; radius_px = 0.0.
+    """
     vis = cv2.cvtColor(small_gray, cv2.COLOR_GRAY2BGR)
     H_vis, W_vis = vis.shape[:2]
     img_cx, img_cy = W_vis / 2.0, H_vis / 2.0
+
+    # ── Pre-contact detection: central disk std ───────────────────────────────
+    # Measure ring texture in a disk around the image centre.  Pre-contact frames
+    # have complete Newton's rings visible near the centre (std ≈ 20–55 in the
+    # CLAHE-enhanced image).  Once contact forms the centre is a flat dark zone
+    # (std ≤ 11 even for the very first contact frame).  This check runs before
+    # contour analysis so it triggers even when contour detection is unreliable.
+    yy, xx = np.mgrid[0:H_vis, 0:W_vis]
+    disk_mask = (xx - img_cx) ** 2 + (yy - img_cy) ** 2 <= CENTRAL_DISK_R ** 2
+    central_std = float(small_gray[disk_mask].astype(np.float64).std())
+    if central_std > CENTRAL_STD_THRESH:
+        # Draw all contours in orange to visualise the pre-contact ring pattern
+        cv2.drawContours(vis, contours, -1, (0, 165, 255), 1)
+        cv2.putText(vis, f"PRE-CONTACT r=0  (std={central_std:.1f})",
+                    (max(0, W_vis // 2 - 200), H_vis // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+        print(f"  [PRE-CONTACT]  {img_name}  central_std={central_std:.1f}  → r=0")
+        return vis, 0.0, "pre_contact"
 
     cnt_infos = []
     for cnt in contours:
@@ -339,33 +380,85 @@ def draw_edges_bgr(small_gray: np.ndarray, contours: list) -> np.ndarray:
                 r  = cnt_infos[min_idx]["fit_radius"]
                 cx_r = int(cnt_infos[min_idx]["cx"])
                 cy_r = int(cnt_infos[min_idx]["cy"])
+
                 cv2.drawContours(vis, [cnt_infos[min_idx]["cnt"]], -1, (0, 0, 255), 2)
                 cv2.circle(vis, (cx_r, cy_r), int(r), (0, 255, 0), 2)
                 cv2.circle(vis, (cx_r, cy_r), 3, (0, 255, 0), 1)
                 cv2.putText(vis, f"r={r:.0f}", (cx_r - 40, cy_r),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 2)
+                print(f"  [DBSCAN]  {img_name}  r={r:.1f}  cx={cx_r}  cy={cy_r}")
                 detected = True
+                return vis, float(r), ""
 
-    # ── Kasa fallback: contact area fills the image, only a partial arc visible ─
-    # Fits a circle algebraically to the largest contour closest to image centre.
+    # ── Kasa fallback: contact area fills the image, only corner/edge arcs visible ─
+    # For each image corner select the arc whose centroid is closest to that corner
+    # (= the innermost fringe just outside the contact edge at that corner).
+    # Combining arcs from ≥2 corners gives a robust algebraic circle fit even when
+    # the full contact boundary circle is never visible as a single closed contour.
     if not detected and len(cnt_infos) > 0:
-        sorted_by_area = sorted(range(len(contours)),
-                                key=lambda i: cnt_infos[i]["area"], reverse=True)
-        top_n = sorted_by_area[:min(5, len(sorted_by_area))]
-        best_i = min(top_n,
-                     key=lambda i: np.hypot(cnt_infos[i]["cx"] - img_cx,
-                                            cnt_infos[i]["cy"] - img_cy))
-        pts = contours[best_i].reshape(-1, 2)
-        result = _fit_circle_kasa(pts)
+        MIN_ARC_AREA = 200   # ignore tiny noise fragments
+
+        # One entry per corner: (corner_row, corner_col)
+        corner_defs = [(0, 0), (0, W_vis), (H_vis, 0), (H_vis, W_vis)]
+        corner_pts_list = []
+        corner_cnts_list = []   # parallel list of contours for drawing
+        d_center_min = min(H_vis, W_vis) / 4   # excludes rogue inner contours
+        for cr, cc in corner_defs:
+            # Candidates in the same quadrant as this corner with area > threshold
+            # and centroid far enough from image centre (excludes rogue noise
+            # fragments inside the dark contact zone, which have small d_center).
+            candidates = [
+                i for i, ci in enumerate(cnt_infos)
+                if ci["area"] > MIN_ARC_AREA
+                and ((ci["cx"] < W_vis / 2) == (cc == 0))
+                and ((ci["cy"] < H_vis / 2) == (cr == 0))
+                and np.hypot(ci["cx"] - img_cx, ci["cy"] - img_cy) > d_center_min
+            ]
+            if candidates:
+                # Contact boundary = the arc with the LARGEST area among the
+                # filtered candidates.  After excluding centroids close to the
+                # image centre the innermost contact ring is always the winner:
+                #   Real images: one dominant arc per corner; the d_center filter
+                #     eliminates rogue inner contours (e.g. BL area=36226 d_c=105).
+                #   Synthetic (multiple rings at corners): all legitimate rings
+                #     have d_center >> d_center_min; the innermost ring
+                #     (contact boundary) subtends the widest angle → largest area.
+                best_i = max(candidates, key=lambda i: cnt_infos[i]["area"])
+                corner_pts_list.append(contours[best_i].reshape(-1, 2))
+                corner_cnts_list.append(contours[best_i])
+
+        # Need arcs from at least 2 corners for a stable fit
+        if len(corner_pts_list) >= 2:
+            combined = np.vstack(corner_pts_list)
+            result = _fit_circle_kasa(combined)
+        elif len(corner_pts_list) == 1:
+            # Only one corner visible — fall back to the single largest arc near centre
+            sorted_by_area = sorted(range(len(contours)),
+                                    key=lambda i: cnt_infos[i]["area"], reverse=True)
+            top_n = sorted_by_area[:min(5, len(sorted_by_area))]
+            best_i = min(top_n,
+                         key=lambda i: np.hypot(cnt_infos[i]["cx"] - img_cx,
+                                                cnt_infos[i]["cy"] - img_cy))
+            result = _fit_circle_kasa(contours[best_i].reshape(-1, 2))
+        else:
+            result = None
+
         if result is not None:
             kx, ky, kr = result
+        if result is not None and kr > 40:
+            # Draw the selected corner arcs in orange so they are visible
+            cv2.drawContours(vis, corner_cnts_list, -1, (0, 165, 255), 2)
             # Cyan circle + asterisk suffix to distinguish Kasa fit from DBSCAN fit
             cv2.circle(vis, (int(kx), int(ky)), int(kr), (0, 255, 255), 2)
             cv2.circle(vis, (int(kx), int(ky)), 3, (0, 255, 255), -1)
             cv2.putText(vis, f"r={kr:.0f}*", (int(kx) - 40, int(ky)),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 200, 200), 2)
+            n_corners = len(corner_pts_list)
+            print(f"  [Kasa/{n_corners}c]  {img_name}  r={kr:.1f}  cx={kx:.1f}  cy={ky:.1f}")
+            return vis, float(kr), ""
 
-    return vis
+    print(f"  [NO-DETECT]  {img_name}")
+    return vis, 0.0, "no_detection"
 
 
 def resolve_calib_paths(calib_dir: Path) -> tuple[Path, Path]:
@@ -488,7 +581,7 @@ def main() -> int:
             _img_back, img_filtered, dft_shift, fshift = fft_mask_filter_roi(roi)
             img_filtered_roi = img_filtered[ROI_SLICE2]
             small, edges, contours = quarter_and_edges(img_filtered_roi)
-            vis = draw_edges_bgr(small, contours)
+            vis, radius_px, flag = draw_edges_bgr(small, contours, img_name=path.name)
 
             if args.show_steps:
                 plot_processing_steps(
